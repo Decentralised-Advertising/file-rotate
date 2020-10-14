@@ -130,6 +130,7 @@ use std::{
     fs::{self, File},
     io::{self, Write},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 // ---
@@ -140,6 +141,8 @@ pub enum RotationMode {
     Bytes(usize),
     /// Cut the log file at line breaks.
     Lines(usize),
+    /// Cut the log file after an elapsed duration.
+    Duration(Duration),
 }
 
 /// The main writer used for rotating logs.
@@ -150,6 +153,7 @@ pub struct FileRotate {
     file_number: usize,
     max_file_number: usize,
     mode: RotationMode,
+    last_rotation: Instant,
 }
 
 impl FileRotate {
@@ -175,6 +179,7 @@ impl FileRotate {
             RotationMode::Lines(lines) => {
                 assert!(lines > 0);
             }
+            RotationMode::Duration(_) => {}
         };
 
         Self {
@@ -187,6 +192,7 @@ impl FileRotate {
             file_number: 0,
             max_file_number,
             mode: rotation_mode,
+            last_rotation: Instant::now(),
         }
     }
 
@@ -201,6 +207,7 @@ impl FileRotate {
 
         self.file_number = (self.file_number + 1) % (self.max_file_number + 1);
         self.count = 0;
+        self.last_rotation = Instant::now();
 
         Ok(())
     }
@@ -241,6 +248,14 @@ impl Write for FileRotate {
                     if self.count >= lines {
                         self.rotate()?;
                     }
+                }
+                if let Some(Err(err)) = self.file.as_mut().map(|file| file.write(buf)) {
+                    return Err(err);
+                }
+            }
+            RotationMode::Duration(duration) => {
+                if self.last_rotation.elapsed() > duration {
+                    self.rotate()?;
                 }
                 if let Some(Err(err)) = self.file.as_mut().map(|file| file.write(buf)) {
                     return Err(err);
