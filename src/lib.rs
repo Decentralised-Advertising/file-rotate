@@ -126,6 +126,8 @@
     unused_qualifications
 )]
 
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::{
     fs::{self, File},
     io::{self, Write},
@@ -136,6 +138,7 @@ use std::{
 // ---
 
 /// Condition on which a file is rotated.
+#[derive(Clone)]
 pub enum RotationMode {
     /// Cut the log at the exact size in bytes.
     Bytes(usize),
@@ -143,17 +146,20 @@ pub enum RotationMode {
     Lines(usize),
     /// Cut the log file after an elapsed duration.
     Duration(Duration),
+    /// Combine multiple rotation modes.
+    Combine(Vec<RotationMode>),
 }
 
 /// The main writer used for rotating logs.
+#[derive(Clone)]
 pub struct FileRotate {
     basename: PathBuf,
-    count: usize,
-    file: Option<File>,
-    file_number: usize,
+    count: Arc<Mutex<usize>>,
+    file: Arc<Mutex<Option<File>>>,
+    file_number: Arc<Mutex<usize>>,
     max_file_number: usize,
     mode: RotationMode,
-    last_rotation: Instant,
+    last_rotation: Arc<Mutex<Instant>>,
 }
 
 impl FileRotate {
@@ -172,7 +178,7 @@ impl FileRotate {
         rotation_mode: RotationMode,
         max_file_number: usize,
     ) -> Self {
-        match rotation_mode {
+        match rotation_mode.clone() {
             RotationMode::Bytes(bytes) => {
                 assert!(bytes > 0);
             }
@@ -180,34 +186,63 @@ impl FileRotate {
                 assert!(lines > 0);
             }
             RotationMode::Duration(_) => {}
+            RotationMode::Combine(modes) => assert!(modes.len() > 0),
         };
 
-        Self {
+        let file_rotate = Self {
             basename: path.as_ref().to_path_buf(),
-            count: 0,
-            file: match File::create(&path) {
+            count: Arc::new(Mutex::new(0)),
+            file: Arc::new(Mutex::new(match File::create(&path) {
                 Ok(file) => Some(file),
                 Err(_) => None,
-            },
-            file_number: 0,
+            })),
+            file_number: Arc::new(Mutex::new(0)),
             max_file_number,
-            mode: rotation_mode,
-            last_rotation: Instant::now(),
+            mode: rotation_mode.clone(),
+            last_rotation: Arc::new(Mutex::new(Instant::now())),
+        };
+
+        let file_rotate_c = file_rotate.clone();
+        if let RotationMode::Duration(duration) = rotation_mode {
+            std::thread::spawn(move || loop {
+                if let Err(_) = file_rotate_c.rotate(false) {
+                    // Handle error?
+                }
+                std::thread::sleep(duration);
+            });
         }
+
+        file_rotate
     }
 
-    fn rotate(&mut self) -> io::Result<()> {
+    fn rotate(&self, force: bool) -> io::Result<()> {
+        if !force {
+            if let Ok(count) = self.count.lock() {
+                if *count == 0 {
+                    return Ok(());
+                }
+            }
+        }
         let mut path = self.basename.clone();
-        path.set_extension(self.file_number.to_string());
 
-        let _ = self.file.take();
+        if let Ok(file_number) = self.file_number.lock() {
+            path.set_extension(file_number.to_string());
+        }
 
-        let _ = fs::rename(&self.basename, path);
-        self.file = Some(File::create(&self.basename)?);
-
-        self.file_number = (self.file_number + 1) % (self.max_file_number + 1);
-        self.count = 0;
-        self.last_rotation = Instant::now();
+        if let Ok(mut file) = self.file.lock() {
+            let _ = file.take();
+            let _ = fs::rename(&self.basename, path);
+            *file = Some(File::create(&self.basename)?);
+            if let Ok(mut file_number) = self.file_number.lock() {
+                *file_number = (*file_number + 1) % (self.max_file_number + 1);
+            }
+            if let Ok(mut count) = self.count.lock() {
+                *count = 0;
+            }
+            if let Ok(mut last_rotation) = self.last_rotation.lock() {
+                *last_rotation = Instant::now();
+            }
+        }
 
         Ok(())
     }
@@ -218,59 +253,84 @@ impl Write for FileRotate {
         let written = buf.len();
         match self.mode {
             RotationMode::Bytes(bytes) => {
-                while self.count + buf.len() > bytes {
-                    let bytes_left = bytes - self.count;
-                    if let Some(Err(err)) = self
-                        .file
-                        .as_mut()
-                        .map(|file| file.write(&buf[..bytes_left]))
-                    {
+                loop {
+                    if let Ok(count) = self.count.lock() {
+                        if let Ok(mut file) = self.file.lock() {
+                        if *count + buf.len() > bytes {
+                            let bytes_left = bytes - *count;
+                                if let Some(Err(err)) =
+                                    file.as_mut().map(|file| file.write(&buf[..bytes_left]))
+                                {
+                                    return Err(err);
+                                }
+                                buf = &buf[bytes_left..];
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    self.rotate(true)?;
+                }
+                if let Ok(mut count) = self.count.lock() {
+                    *count += buf.len();
+                }
+                if let Ok(mut file) = self.file.lock() {
+                    if let Some(Err(err)) = file.as_mut().map(|file| file.write(&buf[..])) {
                         return Err(err);
                     }
-                    self.rotate()?;
-                    buf = &buf[bytes_left..];
-                }
-                self.count += buf.len();
-                if let Some(Err(err)) = self.file.as_mut().map(|file| file.write(&buf[..])) {
-                    return Err(err);
                 }
             }
             RotationMode::Lines(lines) => {
-                while let Some((idx, _)) = buf.iter().enumerate().find(|(_, byte)| *byte == &b'\n')
-                {
-                    if let Some(Err(err)) =
-                        self.file.as_mut().map(|file| file.write(&buf[..idx + 1]))
+                let mut should_rotate = false;
+                if let Ok(mut file) = self.file.lock() {
+                    while let Some((idx, _)) =
+                        buf.iter().enumerate().find(|(_, byte)| *byte == &b'\n')
                     {
+                        if let Some(Err(err)) =
+                            file.as_mut().map(|file| file.write(&buf[..idx + 1]))
+                        {
+                            return Err(err);
+                        }
+                        if let Ok(mut count) = self.count.lock() {
+                            *count += 1;
+                            buf = &buf[idx + 1..];
+                            if *count >= lines {
+                                should_rotate = true;
+                            }
+                        }
+                    }
+                    if let Some(Err(err)) = file.as_mut().map(|file| file.write(buf)) {
                         return Err(err);
                     }
-                    self.count += 1;
-                    buf = &buf[idx + 1..];
-                    if self.count >= lines {
-                        self.rotate()?;
+                }
+                if should_rotate {
+                    self.rotate(false)?;
+                }
+            }
+            RotationMode::Duration(_) => {
+                if let Ok(mut file) = self.file.lock() {
+                    if let Ok(mut count) = self.count.lock() {
+                        *count += 1;
+                    }
+                    if let Some(Err(err)) = file.as_mut().map(|file| file.write(buf)) {
+                        return Err(err);
                     }
                 }
-                if let Some(Err(err)) = self.file.as_mut().map(|file| file.write(buf)) {
-                    return Err(err);
-                }
             }
-            RotationMode::Duration(duration) => {
-                if self.last_rotation.elapsed() > duration {
-                    self.rotate()?;
-                }
-                if let Some(Err(err)) = self.file.as_mut().map(|file| file.write(buf)) {
-                    return Err(err);
-                }
-            }
+            RotationMode::Combine(_) => unimplemented!(),
         }
         Ok(written)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if let Some(Err(err)) = self.file.as_mut().map(|file| file.flush()) {
-            Err(err)
-        } else {
-            Ok(())
+        if let Ok(mut file) = self.file.lock() {
+            if let Some(Err(err)) = file.as_mut().map(|file| file.flush()) {
+                return Err(err);
+            } else {
+                return Ok(());
+            }
         }
+        Ok(())
     }
 }
 
